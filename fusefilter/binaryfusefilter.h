@@ -12,6 +12,14 @@
 #define XOR_MAX_ITERATIONS 100 
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define BF_INLINE __attribute__((always_inline)) inline
+#define BF_RESTRICT __restrict__
+#else
+#define BF_INLINE inline
+#define BF_RESTRICT
+#endif
+
 void erase_elements_conditional(std::vector<uint64_t>& vector_a, std::vector<uint64_t>& vector_b, uint64_t threshold) {
     if (vector_a.size() != vector_b.size()) {
         // Handle error: vectors must be of the same size
@@ -541,6 +549,700 @@ static inline bool binary_fuse8_populate(uint64_t *keys, uint32_t size,
   free(reverseOrder);
   free(startPos);
   return true;
+}
+
+//////////////////
+// fuse10
+//////////////////
+
+typedef struct binary_fuse10_s {
+  uint64_t Seed;
+  uint32_t Size;
+  uint32_t SegmentLength;
+  uint32_t SegmentLengthMask;
+  uint32_t SegmentCount;
+  uint32_t SegmentCountLength;
+  uint32_t ArrayLength;
+  uint16_t *Fingerprints;   // lower 10 bits used
+} binary_fuse10_t;
+
+static inline uint16_t
+binary_fuse10_fingerprint(uint64_t hash) {
+  return (uint16_t)(hash ^ (hash >> 32)) & 0x3FF; // 10 bits
+}
+
+static inline binary_hashes_t
+binary_fuse10_hash_batch(uint64_t hash,
+                         const binary_fuse10_t *filter) {
+  uint64_t hi = binary_fuse_mulhi(hash, filter->SegmentCountLength);
+  binary_hashes_t h;
+  h.h0 = (uint32_t)hi;
+  h.h1 = h.h0 + filter->SegmentLength;
+  h.h2 = h.h1 + filter->SegmentLength;
+  h.h1 ^= (uint32_t)(hash >> 18) & filter->SegmentLengthMask;
+  h.h2 ^= (uint32_t)(hash) & filter->SegmentLengthMask;
+  return h;
+}
+
+static inline uint32_t
+binary_fuse10_hash(uint64_t index, uint64_t hash,
+                   const binary_fuse10_t *filter) {
+  uint64_t h = binary_fuse_mulhi(hash, filter->SegmentCountLength);
+  h += index * filter->SegmentLength;
+  uint64_t hh = hash & ((1ULL << 36) - 1);
+  h ^= (uint32_t)((hh >> (36 - 18 * index)) &
+                  filter->SegmentLengthMask);
+  return (uint32_t)h;
+}
+
+static inline bool
+binary_fuse10_contain(uint64_t key,
+                      const binary_fuse10_t *filter) {
+  uint64_t hash = binary_fuse_mix_split(key, filter->Seed);
+  uint16_t f = binary_fuse10_fingerprint(hash);
+  binary_hashes_t h = binary_fuse10_hash_batch(hash, filter);
+
+  f ^= filter->Fingerprints[h.h0];
+  f ^= filter->Fingerprints[h.h1];
+  f ^= filter->Fingerprints[h.h2];
+
+  return f == 0;
+}
+
+static inline bool
+binary_fuse10_allocate(uint32_t size,
+                       binary_fuse10_t *filter) {
+  const uint32_t arity = 3;
+  filter->Size = size;
+
+  filter->SegmentLength =
+      size ? binary_fuse_calculate_segment_length(arity, size) : 4;
+  if (filter->SegmentLength > 262144)
+    filter->SegmentLength = 262144;
+
+  filter->SegmentLengthMask = filter->SegmentLength - 1;
+
+  double sizeFactor =
+      size > 1 ? binary_fuse_calculate_size_factor(arity, size) : 0.0;
+  uint32_t capacity =
+      size > 1 ? (uint32_t)(size * sizeFactor + 0.5) : 0;
+
+  uint32_t initSeg =
+      (capacity + filter->SegmentLength - 1) / filter->SegmentLength -
+      (arity - 1);
+
+  filter->ArrayLength =
+      (initSeg + arity - 1) * filter->SegmentLength;
+
+  filter->SegmentCount =
+      filter->ArrayLength / filter->SegmentLength;
+
+  if (filter->SegmentCount <= arity - 1)
+    filter->SegmentCount = 1;
+  else
+    filter->SegmentCount -= (arity - 1);
+
+  filter->ArrayLength =
+      (filter->SegmentCount + arity - 1) * filter->SegmentLength;
+
+  filter->SegmentCountLength =
+      filter->SegmentCount * filter->SegmentLength;
+
+  filter->Fingerprints =
+      (uint16_t *)calloc(filter->ArrayLength, sizeof(uint16_t));
+
+  return filter->Fingerprints != NULL;
+}
+static inline bool
+binary_fuse10_populate(uint64_t *keys, uint32_t size,
+                       binary_fuse10_t *filter) {
+  if (size != filter->Size) return false;
+
+  uint64_t rng = 0x726b2b9d438b9d4dULL;
+  filter->Seed = binary_fuse_rng_splitmix64(&rng);
+
+  uint32_t capacity = filter->ArrayLength;
+
+  uint64_t *reverseOrder = (uint64_t*)calloc(size + 1, sizeof(uint64_t));
+  uint64_t *t2hash = (uint64_t*)calloc(capacity, sizeof(uint64_t));
+  uint8_t  *t2count = (uint8_t*)calloc(capacity, sizeof(uint8_t));
+  uint32_t *alone = (uint32_t*)malloc(capacity * sizeof(uint32_t));
+  uint8_t  *reverseH = (uint8_t*)malloc(size * sizeof(uint8_t));
+  if (!reverseOrder || !t2hash || !t2count || !alone || !reverseH)
+    return false;
+
+  reverseOrder[size] = 1;
+
+  for (;;) {
+    memset(t2count, 0, capacity);
+    memset(t2hash, 0, capacity * sizeof(uint64_t));
+
+    for (uint32_t i = 0; i < size; i++) {
+      uint64_t h = binary_fuse_murmur64(keys[i] + filter->Seed);
+      reverseOrder[i] = h;
+
+      for (uint32_t j = 0; j < 3; j++) {
+        uint32_t idx = binary_fuse10_hash(j, h, filter);
+        t2count[idx] += 4;
+        t2count[idx] ^= j;
+        t2hash[idx] ^= h;
+      }
+    }
+
+    uint32_t q = 0;
+    for (uint32_t i = 0; i < capacity; i++)
+      if ((t2count[i] >> 2) == 1)
+        alone[q++] = i;
+
+    uint32_t stack = 0;
+    while (q) {
+      uint32_t idx = alone[--q];
+      if ((t2count[idx] >> 2) != 1) continue;
+
+      uint64_t h = t2hash[idx];
+      uint8_t which = t2count[idx] & 3;
+
+      reverseH[stack] = which;
+      reverseOrder[stack++] = h;
+
+      for (uint32_t j = 0; j < 3; j++) {
+        if (j == which) continue;
+        uint32_t o = binary_fuse10_hash(j, h, filter);
+        t2count[o] -= 4;
+        t2count[o] ^= j;
+        t2hash[o] ^= h;
+        if ((t2count[o] >> 2) == 1)
+          alone[q++] = o;
+      }
+    }
+
+    if (stack == size) break;
+    filter->Seed = binary_fuse_rng_splitmix64(&rng);
+  }
+
+  for (uint32_t i = size; i-- > 0;) {
+    uint64_t h = reverseOrder[i];
+    uint16_t fp = binary_fuse10_fingerprint(h);
+    uint8_t which = reverseH[i];
+
+    uint16_t v = fp;
+    for (uint32_t j = 0; j < 3; j++) {
+      if (j != which)
+        v ^= filter->Fingerprints[
+              binary_fuse10_hash(j, h, filter)];
+    }
+
+    filter->Fingerprints[
+      binary_fuse10_hash(which, h, filter)] = v;
+  }
+
+  free(reverseOrder);
+  free(t2hash);
+  free(t2count);
+  free(alone);
+  free(reverseH);
+  return true;
+}
+
+//////////////////
+// fuse12
+//////////////////
+
+#define BF12_BITS 12U
+#define BF12_MASK ((1U << BF12_BITS) - 1U)
+
+
+
+typedef struct binary_fuse12_s {
+    uint64_t Seed;
+    uint32_t Size;
+    uint32_t SegmentLength;
+    uint32_t SegmentLengthMask;
+    uint32_t SegmentCount;
+    uint32_t SegmentCountLength;
+    uint32_t ArrayLength;
+    uint8_t *Fingerprints; /* packed 12-bit */
+} binary_fuse12_t;
+
+/* Needs only 3 bytes */
+static inline uint16_t
+load12(const uint8_t *buf, uint32_t idx) {
+    size_t bit  = (size_t)idx * BF12_BITS;
+    size_t byte = bit >> 3;
+    uint32_t sh = bit & 7U;
+
+    uint32_t w =
+        (uint32_t)buf[byte] |
+        ((uint32_t)buf[byte + 1] << 8) |
+        ((uint32_t)buf[byte + 2] << 16);
+
+    return (uint16_t)((w >> sh) & BF12_MASK);
+}
+
+static inline void
+store12(uint8_t *buf, uint32_t idx, uint16_t v) {
+    size_t bit  = (size_t)idx * BF12_BITS;
+    size_t byte = bit >> 3;
+    uint32_t sh = bit & 7U;
+
+    uint32_t w =
+        (uint32_t)buf[byte] |
+        ((uint32_t)buf[byte + 1] << 8) |
+        ((uint32_t)buf[byte + 2] << 16);
+
+    uint32_t mask = BF12_MASK << sh;
+    w = (w & ~mask) | ((uint32_t)(v & BF12_MASK) << sh);
+
+    buf[byte]     = (uint8_t)w;
+    buf[byte + 1] = (uint8_t)(w >> 8);
+    buf[byte + 2] = (uint8_t)(w >> 16);
+}
+
+static inline uint16_t
+binary_fuse12_fingerprint(uint64_t hash) {
+    uint16_t fp = (uint16_t)((hash ^ (hash >> 32)) & BF12_MASK);
+    return fp ? fp : 1;
+}
+
+static inline binary_hashes_t
+binary_fuse12_hash_batch(uint64_t hash, const binary_fuse12_t *f) {
+    uint64_t h = binary_fuse_mulhi(hash, f->SegmentCountLength);
+    binary_hashes_t r;
+    r.h0 = (uint32_t)h;
+    r.h1 = r.h0 + f->SegmentLength;
+    r.h2 = r.h1 + f->SegmentLength;
+    r.h1 ^= (uint32_t)(hash >> 18) & f->SegmentLengthMask;
+    r.h2 ^= (uint32_t)hash & f->SegmentLengthMask;
+    return r;
+}
+
+BF_INLINE binary_hashes_t
+binary_fuse12_hash3(uint64_t h, const binary_fuse12_t * BF_RESTRICT f) {
+    uint64_t base = binary_fuse_mulhi(h, f->SegmentCountLength);
+    uint32_t h0 = (uint32_t)base;
+    uint32_t h1 = h0 + f->SegmentLength;
+    uint32_t h2 = h1 + f->SegmentLength;
+
+    uint32_t mask = f->SegmentLengthMask;
+    h1 ^= (uint32_t)(h >> 18) & mask;
+    h2 ^= (uint32_t)h & mask;
+
+    return (binary_hashes_t){h0, h1, h2};
+}
+
+static inline uint32_t
+binary_fuse12_hash(uint32_t index, uint64_t hash,
+                   const binary_fuse12_t *f) {
+    uint64_t h = binary_fuse_mulhi(hash, f->SegmentCountLength);
+    h += index * f->SegmentLength;
+    uint64_t hh = hash & ((1ULL << 36) - 1);
+    h ^= (hh >> (36 - 18 * index)) & f->SegmentLengthMask;
+    return (uint32_t)h;
+}
+
+
+static inline bool
+binary_fuse12_contain(uint64_t key, const binary_fuse12_t *f) {
+    uint64_t h = binary_fuse_mix_split(key, f->Seed);
+    uint16_t fp = binary_fuse12_fingerprint(h);
+    binary_hashes_t x = binary_fuse12_hash_batch(h, f);
+
+    fp ^= load12(f->Fingerprints, x.h0)
+        ^ load12(f->Fingerprints, x.h1)
+        ^ load12(f->Fingerprints, x.h2);
+
+    return fp == 0;
+}
+
+/* ================= ALLOC ================= */
+
+static inline bool
+binary_fuse12_allocate(uint32_t size, binary_fuse12_t *f) {
+    uint32_t arity = 3;
+    f->Size = size;
+    f->SegmentLength = size ? binary_fuse_calculate_segment_length(arity, size) : 4;
+    if (f->SegmentLength > 262144) f->SegmentLength = 262144;
+    f->SegmentLengthMask = f->SegmentLength - 1;
+
+    double factor = size > 1 ? binary_fuse_calculate_size_factor(arity, size) : 0;
+    uint32_t cap = (uint32_t)round(size * factor);
+
+    uint32_t sc =
+        (cap + f->SegmentLength - 1) / f->SegmentLength - (arity - 1);
+    f->ArrayLength = (sc + arity - 1) * f->SegmentLength;
+
+    f->SegmentCount =
+        (f->ArrayLength / f->SegmentLength > arity - 1)
+            ? f->ArrayLength / f->SegmentLength - (arity - 1)
+            : 1;
+
+    f->ArrayLength = (f->SegmentCount + arity - 1) * f->SegmentLength;
+    f->SegmentCountLength = f->SegmentCount * f->SegmentLength;
+
+    size_t bits  = (size_t)f->ArrayLength * BF12_BITS;
+    size_t bytes = (bits + 7) >> 3;
+
+    f->Fingerprints = (uint8_t *)calloc(bytes + 3, 1);
+    return f->Fingerprints != NULL;
+}
+
+static inline size_t
+binary_fuse12_size_in_bytes(const binary_fuse12_t *f) {
+    return ((size_t)f->ArrayLength * BF12_BITS + 7) / 8
+           + sizeof(binary_fuse12_t);
+}
+
+static inline void
+binary_fuse12_free(binary_fuse12_t *f) {
+    free(f->Fingerprints);
+    memset(f, 0, sizeof(*f));
+}
+
+/* ================= POPULATE ================= */
+
+static inline bool
+binary_fuse12_populate(uint64_t *keys, uint32_t size,
+                       binary_fuse12_t *f) {
+    if (size != f->Size) return false;
+
+    uint64_t rng = 0x726b2b9d438b9d4dULL;
+    f->Seed = binary_fuse_rng_splitmix64(&rng);
+
+    uint32_t cap = f->ArrayLength;
+    uint64_t *reverseOrder = (uint64_t*)calloc(size + 1, sizeof(uint64_t));
+    uint64_t *t2hash = (uint64_t*)calloc(cap, sizeof(uint64_t));
+    uint8_t  *t2count = (uint8_t*)calloc(cap, 1);
+    uint32_t *alone = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    uint8_t  *reverseH = (uint8_t*)malloc(size);
+    if (!reverseOrder || !t2hash || !t2count || !alone || !reverseH)
+        return false;
+
+    uint32_t h012[5];
+
+    for (;;) {
+        memset(t2count, 0, cap);
+        memset(t2hash, 0, cap * sizeof(uint64_t));
+        memset(reverseOrder, 0, size * sizeof(uint64_t));
+
+        for (uint32_t i = 0; i < size; i++) {
+            uint64_t h = binary_fuse_murmur64(keys[i] + f->Seed);
+            reverseOrder[i] = h;
+
+            uint32_t h0 = binary_fuse12_hash(0, h, f);
+            uint32_t h1 = binary_fuse12_hash(1, h, f);
+            uint32_t h2 = binary_fuse12_hash(2, h, f);
+
+            t2count[h0] += 4; t2hash[h0] ^= h;
+            t2count[h1] += 4; t2count[h1] ^= 1; t2hash[h1] ^= h;
+            t2count[h2] += 4; t2count[h2] ^= 2; t2hash[h2] ^= h;
+        }
+
+        uint32_t Q = 0;
+        for (uint32_t i = 0; i < cap; i++)
+            if ((t2count[i] >> 2) == 1)
+                alone[Q++] = i;
+
+        uint32_t stack = 0;
+        while (Q) {
+            uint32_t idx = alone[--Q];
+            if ((t2count[idx] >> 2) != 1) continue;
+
+            uint64_t h = t2hash[idx];
+            uint8_t found = t2count[idx] & 3;
+            reverseOrder[stack] = h;
+            reverseH[stack++] = found;
+
+            h012[0] = binary_fuse12_hash(0, h, f);
+            h012[1] = binary_fuse12_hash(1, h, f);
+            h012[2] = binary_fuse12_hash(2, h, f);
+            h012[3] = h012[0];
+            h012[4] = h012[1];
+
+            for (int j = 1; j <= 2; j++) {
+                uint32_t o = h012[found + j];
+                t2count[o] -= 4;
+                t2count[o] ^= binary_fuse_mod3(found + j);
+                t2hash[o] ^= h;
+                if ((t2count[o] >> 2) == 1)
+                    alone[Q++] = o;
+            }
+        }
+
+        if (stack == size) {
+            for (int i = (int)size - 1; i >= 0; i--) {
+                uint64_t h = reverseOrder[i];
+                uint16_t fp = binary_fuse12_fingerprint(h);
+                uint8_t found = reverseH[i];
+
+                h012[0] = binary_fuse12_hash(0, h, f);
+                h012[1] = binary_fuse12_hash(1, h, f);
+                h012[2] = binary_fuse12_hash(2, h, f);
+                h012[3] = h012[0];
+                h012[4] = h012[1];
+
+                uint16_t v =
+                    fp ^
+                    load12(f->Fingerprints, h012[found + 1]) ^
+                    load12(f->Fingerprints, h012[found + 2]);
+
+                store12(f->Fingerprints, h012[found], v);
+            }
+            break;
+        }
+
+        f->Seed = binary_fuse_rng_splitmix64(&rng);
+    }
+
+    free(reverseOrder);
+    free(t2hash);
+    free(t2count);
+    free(alone);
+    free(reverseH);
+    return true;
+}
+
+//////////////////
+// fuse14
+//////////////////
+
+#define BF14_BITS 14U
+#define BF14_MASK ((1U << BF14_BITS) - 1U)
+
+/* Safe: needs only 3 bytes + overlap */
+static inline uint16_t load14(const uint8_t *buf, uint32_t idx) {
+    size_t bit = (size_t)idx * BF14_BITS;
+    size_t byte = bit >> 3;
+    uint32_t shift = bit & 7U;
+
+    uint32_t w =
+        (uint32_t)buf[byte] |
+        ((uint32_t)buf[byte + 1] << 8) |
+        ((uint32_t)buf[byte + 2] << 16);
+
+    return (uint16_t)((w >> shift) & BF14_MASK);
+}
+
+static inline void store14(uint8_t *buf, uint32_t idx, uint16_t val) {
+    size_t bit = (size_t)idx * BF14_BITS;
+    size_t byte = bit >> 3;
+    uint32_t shift = bit & 7U;
+
+    uint32_t w =
+        (uint32_t)buf[byte] |
+        ((uint32_t)buf[byte + 1] << 8) |
+        ((uint32_t)buf[byte + 2] << 16);
+
+    uint32_t mask = BF14_MASK << shift;
+    w = (w & ~mask) | ((uint32_t)(val & BF14_MASK) << shift);
+
+    buf[byte]     = (uint8_t)(w);
+    buf[byte + 1] = (uint8_t)(w >> 8);
+    buf[byte + 2] = (uint8_t)(w >> 16);
+}
+
+
+typedef struct binary_fuse14_s {
+    uint64_t Seed;
+    uint32_t Size;
+    uint32_t SegmentLength;
+    uint32_t SegmentLengthMask;
+    uint32_t SegmentCount;
+    uint32_t SegmentCountLength;
+    uint32_t ArrayLength;
+    uint8_t *Fingerprints; /* packed 14-bit array */
+    // Destructor to deallocate memory
+    ~binary_fuse14_s(){
+        // First, delete the objects pointed to by each pointer (if they were allocated)
+        free(Fingerprints);
+    }
+} binary_fuse14_t;
+
+
+static inline uint16_t binary_fuse14_fingerprint(uint64_t hash) {
+    uint16_t fp = (uint16_t)((hash ^ (hash >> 32)) & BF14_MASK);
+    return fp ? fp : 1; /* avoid zero */
+}
+
+static inline binary_hashes_t
+binary_fuse14_hash_batch(uint64_t hash, const binary_fuse14_t *f) {
+    uint64_t h = binary_fuse_mulhi(hash, f->SegmentCountLength);
+    binary_hashes_t r;
+    r.h0 = (uint32_t)h;
+    r.h1 = r.h0 + f->SegmentLength;
+    r.h2 = r.h1 + f->SegmentLength;
+    r.h1 ^= (uint32_t)(hash >> 18U) & f->SegmentLengthMask;
+    r.h2 ^= (uint32_t)(hash) & f->SegmentLengthMask;
+    return r;
+}
+
+static inline uint32_t
+binary_fuse14_hash(uint32_t index, uint64_t hash,
+                   const binary_fuse14_t *f) {
+    uint64_t h = binary_fuse_mulhi(hash, f->SegmentCountLength);
+    h += index * f->SegmentLength;
+    uint64_t hh = hash & ((1ULL << 36) - 1);
+    h ^= (hh >> (36 - 18 * index)) & f->SegmentLengthMask;
+    return (uint32_t)h;
+}
+
+static inline bool
+binary_fuse14_contain(uint64_t key, const binary_fuse14_t *filter) {
+    uint64_t h = binary_fuse_mix_split(key, filter->Seed);
+    uint16_t fp = binary_fuse14_fingerprint(h);
+    binary_hashes_t hashes = binary_fuse14_hash_batch(h, filter);
+
+    uint16_t a = load14(filter->Fingerprints, hashes.h0);
+    uint16_t b = load14(filter->Fingerprints, hashes.h1);
+    uint16_t c = load14(filter->Fingerprints, hashes.h2);
+
+    fp ^= a ^ b ^ c;
+    return fp == 0;
+}
+
+
+static inline bool
+binary_fuse14_allocate(uint32_t size, binary_fuse14_t *f) {
+  uint32_t arity = 3;
+    f->Size = size;
+    f->SegmentLength = size ? binary_fuse_calculate_segment_length(arity, size) : 4;
+    if (f->SegmentLength > 262144) f->SegmentLength = 262144;
+    f->SegmentLengthMask = f->SegmentLength - 1;
+
+    double factor = size > 1 ? binary_fuse_calculate_size_factor(arity, size) : 0;
+    uint32_t cap = (uint32_t)round(size * factor);
+
+    uint32_t sc =
+        (cap + f->SegmentLength - 1) / f->SegmentLength - (arity - 1);
+    f->ArrayLength = (sc + arity - 1) * f->SegmentLength;
+
+    f->SegmentCount =
+        (f->ArrayLength / f->SegmentLength > arity - 1)
+            ? f->ArrayLength / f->SegmentLength - (arity - 1)
+            : 1;
+
+    f->ArrayLength = (f->SegmentCount + arity - 1) * f->SegmentLength;
+    f->SegmentCountLength = f->SegmentCount * f->SegmentLength;
+
+    size_t bits = (size_t)f->ArrayLength * BF14_BITS;
+    size_t bytes = (bits + 7) >> 3;
+
+    f->Fingerprints = (uint8_t *)calloc(bytes + 3, 1);
+    return f->Fingerprints != NULL;
+}
+
+static inline size_t
+binary_fuse14_size_in_bytes(const binary_fuse14_t *f) {
+    return ((size_t)f->ArrayLength * BF14_BITS + 7) / 8
+           + sizeof(binary_fuse14_t);
+}
+
+static inline void
+binary_fuse14_free(binary_fuse14_t *f) {
+    free(f->Fingerprints);
+    memset(f, 0, sizeof(*f));
+}
+
+
+static inline bool
+binary_fuse14_populate(uint64_t *keys, uint32_t size,
+                       binary_fuse14_t *f) {
+    if (size != f->Size) return false;
+
+    uint64_t rng = 0x726b2b9d438b9d4dULL;
+    f->Seed = binary_fuse_rng_splitmix64(&rng);
+
+    uint32_t cap = f->ArrayLength;
+    uint64_t *reverseOrder = (uint64_t*)calloc(size + 1, sizeof(uint64_t));
+    uint64_t *t2hash = (uint64_t*)calloc(cap, sizeof(uint64_t));
+    uint8_t  *t2count = (uint8_t*)calloc(cap, 1);
+    uint32_t *alone = (uint32_t*)malloc(cap * sizeof(uint32_t));
+    uint8_t  *reverseH = (uint8_t*)malloc(size);
+
+    if (!reverseOrder || !t2hash || !t2count || !alone || !reverseH)
+        return false;
+
+    uint32_t h012[5];
+
+    for (;;) {
+        memset(t2count, 0, cap);
+        memset(t2hash, 0, cap * sizeof(uint64_t));
+        memset(reverseOrder, 0, size * sizeof(uint64_t));
+
+        for (uint32_t i = 0; i < size; i++) {
+            uint64_t h = binary_fuse_murmur64(keys[i] + f->Seed);
+            reverseOrder[i] = h;
+
+            uint32_t h0 = binary_fuse14_hash(0, h, f);
+            uint32_t h1 = binary_fuse14_hash(1, h, f);
+            uint32_t h2 = binary_fuse14_hash(2, h, f);
+
+            t2count[h0] += 4; t2hash[h0] ^= h;
+            t2count[h1] += 4; t2count[h1] ^= 1; t2hash[h1] ^= h;
+            t2count[h2] += 4; t2count[h2] ^= 2; t2hash[h2] ^= h;
+        }
+
+        uint32_t Q = 0;
+        for (uint32_t i = 0; i < cap; i++)
+            if ((t2count[i] >> 2) == 1)
+                alone[Q++] = i;
+
+        uint32_t stack = 0;
+        while (Q) {
+            uint32_t idx = alone[--Q];
+            if ((t2count[idx] >> 2) != 1) continue;
+
+            uint64_t h = t2hash[idx];
+            uint8_t found = t2count[idx] & 3;
+            reverseOrder[stack] = h;
+            reverseH[stack++] = found;
+
+            h012[0] = binary_fuse14_hash(0, h, f);
+            h012[1] = binary_fuse14_hash(1, h, f);
+            h012[2] = binary_fuse14_hash(2, h, f);
+            h012[3] = h012[0];
+            h012[4] = h012[1];
+
+            for (int j = 1; j <= 2; j++) {
+                uint32_t o = h012[found + j];
+                t2count[o] -= 4;
+                t2count[o] ^= binary_fuse_mod3(found + j);
+                t2hash[o] ^= h;
+                if ((t2count[o] >> 2) == 1)
+                    alone[Q++] = o;
+            }
+        }
+
+        if (stack == size) {
+            for (int i = (int)size - 1; i >= 0; i--) {
+                uint64_t h = reverseOrder[i];
+                uint16_t fp = binary_fuse14_fingerprint(h);
+                uint8_t found = reverseH[i];
+
+                h012[0] = binary_fuse14_hash(0, h, f);
+                h012[1] = binary_fuse14_hash(1, h, f);
+                h012[2] = binary_fuse14_hash(2, h, f);
+                h012[3] = h012[0];
+                h012[4] = h012[1];
+
+                uint16_t v =
+                    fp ^
+                    load14(f->Fingerprints, h012[found + 1]) ^
+                    load14(f->Fingerprints, h012[found + 2]);
+
+                store14(f->Fingerprints, h012[found], v);
+            }
+            break;
+        }
+
+        f->Seed = binary_fuse_rng_splitmix64(&rng);
+    }
+
+    free(reverseOrder);
+    free(t2hash);
+    free(t2count);
+    free(alone);
+    free(reverseH);
+    return true;
 }
 
 //////////////////
